@@ -1,0 +1,9 @@
+{
+  "name": "record-test-video",
+  "private": true,
+  "type": "module",
+  "description": "Runtime of the record-test-video skill: Playwright pinned for page.screencast",
+  "dependencies": {
+    "playwright": "1.59.1"
+  }
+}
