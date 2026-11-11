@@ -2,7 +2,7 @@
 // No secrets in this file: logins and passwords come from ~/test-videos/<project>/credentials.env, as creds.
 import { homedir } from 'node:os';
 
-const { runScenarios, expect } = await import(`${homedir()}/.agents/skills/record-test-video/scripts/recorder.mjs`);
+const { runScenarios, expect } = await import(`${homedir()}/.agents/skills/skills-catalog/record-test-video/scripts/recorder.mjs`);
 
 await runScenarios({
   outDir: '~/test-videos/<project>/<task>',
