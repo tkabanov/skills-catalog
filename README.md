@@ -8,7 +8,7 @@ My agent skills (Claude Code, Codex, …), one folder per skill in `skills/`.
 
 ## Install
 
-With [Herdr](https://github.com/tkabanov/herdr-setup), install the whole catalog as one skill group; the Skills panel then shows updates from this repo:
+With Herdr, install the whole catalog as one skill group; the Skills panel then shows updates from this repo:
 
 ```sh
 skills-update --add skills-catalog https://github.com/tkabanov/skills-catalog.git skills --title "Skills catalog"
