@@ -83,33 +83,99 @@ async function underCaption(page, target) {
  * Draws the pointer, which a headless browser doesn't, and marks clicks. Runs in the page. Not screencast.showActions:
  * it always draws the action's title, which quotes typed values ('Fill "<password>"'), and fontSize: 0 does not hide it.
  * On a touch screen the pointer is a fingertip: a round mark, centred on the point.
+ *
+ * The top layer: a modal <dialog> (a drawer) or a popover opened by the page sits above every z-index, under its
+ * blurred backdrop. Playwright's overlays (captions, highlights) live in its own popover, <x-pw-glass>, raised only
+ * when it is installed, so a dialog opened after that covered the captions. The pointer and the click marks are
+ * popovers here too, and each time the page opens a dialog or a popover, the glass and then the pointer are shown
+ * again, which puts them back on top. Hiding and showing in one task paints nothing in between.
  */
 const drawPointer = ({ touch }) => {
   const NS = 'http://www.w3.org/2000/svg';
+  // what a popover gets from the browser's own styles and must not have here
+  const RESET = 'margin:0;padding:0;inset:auto;overflow:visible;background:none;';
   let pointer = null;
+  let raising = false;
+  const showOnTop = (element) => {
+    if (!element?.isConnected) return;
+    try {
+      if (element.matches(':popover-open')) element.hidePopover();
+      element.showPopover();
+    } catch {
+      // not a popover in this browser, or the page is going away: only the look suffers
+    }
+  };
+  const raise = () => {
+    if (raising) return;
+    raising = true;
+    try {
+      const glass = document.querySelector('x-pw-glass');
+      if (glass?.matches(':popover-open')) showOnTop(glass);
+      showOnTop(pointer);
+    } finally {
+      raising = false;
+    }
+  };
+  const asPopover = (element) => {
+    element.setAttribute('popover', 'manual');
+    element.dataset.pwRecorder = '';
+    document.documentElement.append(element);
+    showOnTop(element);
+  };
+  // the page's own dialogs and popovers: raise ours once theirs are open
+  const after = (proto, name) => {
+    const original = proto[name];
+    if (typeof original !== 'function') return;
+    proto[name] = function (...args) {
+      const result = original.apply(this, args);
+      if (!raising && !(this instanceof Element && this.hasAttribute('data-pw-recorder'))) raise();
+      return result;
+    };
+  };
+  after(HTMLDialogElement.prototype, 'showModal');
+  after(HTMLElement.prototype, 'showPopover');
+  after(HTMLElement.prototype, 'togglePopover');
+  // Opened from markup (popovertarget, commandfor) or in full screen: no method of the page is called. The toggle event
+  // does not bubble but is seen while capturing; it comes a task later, so for a moment theirs can be on top.
+  const isOurs = (target) => target instanceof Element && (target.hasAttribute('data-pw-recorder') || target.localName === 'x-pw-glass');
+  addEventListener('toggle', (event) => {
+    if (event.newState === 'open' && !isOurs(event.target)) raise();
+  }, true);
+  addEventListener('fullscreenchange', () => {
+    if (document.fullscreenElement) raise();
+  }, true);
+
   addEventListener('mousemove', ({ clientX, clientY }) => {
     if (!pointer && touch) {
       pointer = document.createElement('div');
-      pointer.style.cssText = 'position:fixed;left:0;top:0;width:26px;height:26px;box-sizing:border-box;border-radius:50%;background:rgba(17,24,39,.3);border:2px solid #fff;pointer-events:none;z-index:2147483646;box-shadow:0 1px 3px rgba(0,0,0,.45)';
-      document.documentElement.append(pointer);
+      pointer.style.cssText = `${RESET}position:fixed;left:0;top:0;width:26px;height:26px;box-sizing:border-box;border-radius:50%;background:rgba(17,24,39,.3);border:2px solid #fff;pointer-events:none;z-index:2147483646;box-shadow:0 1px 3px rgba(0,0,0,.45)`;
+      asPopover(pointer);
     } else if (!pointer) {
-      pointer = document.createElementNS(NS, 'svg');
-      pointer.setAttribute('viewBox', '0 0 20 24');
-      pointer.style.cssText = 'position:fixed;left:0;top:0;width:20px;height:24px;pointer-events:none;z-index:2147483646;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45))';
+      // an <svg> cannot be a popover: it sits in a <div> that is one
+      pointer = document.createElement('div');
+      pointer.style.cssText = `${RESET}border:0;position:fixed;left:0;top:0;width:20px;height:24px;pointer-events:none;z-index:2147483646;filter:drop-shadow(0 1px 2px rgba(0,0,0,.45))`;
+      const svg = document.createElementNS(NS, 'svg');
+      svg.setAttribute('viewBox', '0 0 20 24');
+      svg.setAttribute('width', '20');
+      svg.setAttribute('height', '24');
+      svg.style.display = 'block';
       const arrow = document.createElementNS(NS, 'path');
       arrow.setAttribute('d', 'M2 1 L2 19 L7 14.5 L10.5 22 L13.5 20.6 L10 13.2 L16.5 13 Z');
       arrow.setAttribute('fill', '#111827');
       arrow.setAttribute('stroke', '#fff');
       arrow.setAttribute('stroke-width', '1.5');
-      pointer.append(arrow);
-      document.documentElement.append(pointer);
+      svg.append(arrow);
+      pointer.append(svg);
+      asPopover(pointer);
     }
     pointer.style.transform = touch ? `translate(${clientX - 13}px, ${clientY - 13}px)` : `translate(${clientX - 2}px, ${clientY - 1}px)`;
   }, true);
   addEventListener('pointerdown', ({ clientX, clientY }) => {
     const mark = document.createElement('div');
-    mark.style.cssText = `position:fixed;left:${clientX - 16}px;top:${clientY - 16}px;width:32px;height:32px;box-sizing:border-box;border-radius:50%;background:rgba(37,99,235,.35);border:2px solid rgba(37,99,235,.9);pointer-events:none;z-index:2147483645`;
-    document.documentElement.append(mark);
+    mark.style.cssText = `${RESET}position:fixed;left:${clientX - 16}px;top:${clientY - 16}px;width:32px;height:32px;box-sizing:border-box;border-radius:50%;background:rgba(37,99,235,.35);border:2px solid rgba(37,99,235,.9);pointer-events:none;z-index:2147483645`;
+    asPopover(mark);
+    // the pointer stays above the mark
+    showOnTop(pointer);
     setTimeout(() => mark.remove(), 700);
   }, true);
 };
@@ -137,15 +203,73 @@ async function movePointer(page, x, y) {
 
 /** A smooth scroll, and only when needed; the element ends clear of a sticky header and of the caption */
 async function scrollSmoothly(locator) {
-  const height = locator.page().viewportSize()?.height ?? VIEWPORT.height;
+  const { width, height } = locator.page().viewportSize() ?? VIEWPORT;
   let box = await locator.boundingBox({ timeout: 1000 });
-  if (!box || (box.y >= FIXED_TOP_PX && box.y + box.height <= height - CAPTION_PX)) return;
-  await locator.evaluate((node) => node.scrollIntoView({ behavior: 'smooth', block: 'center' }));
+  if (!box || (box.y >= FIXED_TOP_PX && box.y + box.height <= height - CAPTION_PX && box.x >= 0 && box.x + box.width <= width)) return;
+  // Like a wheel, not scrollIntoView: that one also scrolls overflow:hidden boxes, which a person can't, so a drawer
+  // with a few hidden pixels of overflow slid up in the video. Each box that really scrolls, innermost first, on both
+  // axes, centres the element in the part of it that is on screen, as far as it can. Out of a shadow root through its
+  // host; the page stays put when it is locked (overflow hidden, as under a modal) or the element sits in a fixed box.
+  await locator.evaluate((node, { safeTop, safeBottom }) => {
+    const parentOf = (el) => el.assignedSlot ?? el.parentElement ?? (el.parentNode instanceof ShadowRoot ? el.parentNode.host : null);
+    const scrolls = (value) => value === 'auto' || value === 'scroll';
+    const page = document.scrollingElement ?? document.documentElement;
+    const scrollers = [];
+    let fixed = false;
+    for (let el = parentOf(node); el; el = parentOf(el)) {
+      if (el === page) continue;
+      const style = getComputedStyle(el);
+      const y = scrolls(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
+      const x = scrolls(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
+      if (x || y) scrollers.push({ el, x, y });
+      if (style.position === 'fixed') {
+        fixed = true;
+        break;
+      }
+    }
+    if (!fixed) {
+      // the page's overflow is the root's, or the body's when the root's is visible
+      const root = getComputedStyle(document.documentElement), body = document.body ? getComputedStyle(document.body) : root;
+      const open = (axis) => {
+        const value = root[axis] === 'visible' ? body[axis] : root[axis];
+        return value !== 'hidden' && value !== 'clip';
+      };
+      scrollers.push({ el: page, x: open('overflowX'), y: open('overflowY'), page: true });
+    }
+    const view = { top: safeTop, bottom: innerHeight - safeBottom, left: 0, right: innerWidth };
+    const pending = { x: 0, y: 0 };
+    const along = (scroller, axis) => {
+      const [start, end, size, offset, scrollSize, clientSize] = axis === 'y'
+        ? ['top', 'bottom', 'height', 'scrollTop', 'scrollHeight', 'clientHeight']
+        : ['left', 'right', 'width', 'scrollLeft', 'scrollWidth', 'clientWidth'];
+      const box = node.getBoundingClientRect();
+      const from = box[start] - pending[axis], to = box[end] - pending[axis];
+      const rect = scroller.page ? view : scroller.el.getBoundingClientRect();
+      // the part of the box on screen; a box off screen counts whole
+      let low = Math.max(rect[start], view[start]), high = Math.min(rect[end], view[end]);
+      if (high - low < box[size]) [low, high] = [rect[start], rect[end]];
+      if (from >= low && to <= high) return 0;
+      const wanted = (from + to) / 2 - (low + high) / 2;
+      const { el } = scroller;
+      const room = wanted > 0 ? el[scrollSize] - el[clientSize] - el[offset] : -el[offset];
+      const delta = wanted > 0 ? Math.min(wanted, room) : Math.max(wanted, room);
+      return Math.abs(delta) < 1 ? 0 : delta;
+    };
+    for (const scroller of scrollers) {
+      const top = scroller.y ? along(scroller, 'y') : 0, left = scroller.x ? along(scroller, 'x') : 0;
+      if (!top && !left) continue;
+      scroller.el.scrollBy({ top, left, behavior: 'smooth' });
+      // the smooth scroll has not moved the element yet: count it as done for the next box
+      pending.y += top;
+      pending.x += left;
+    }
+  }, { safeTop: FIXED_TOP_PX, safeBottom: CAPTION_PX });
   for (let i = 0, last = null; i < 25; i += 1) {
     await sleep(80);
     box = await locator.boundingBox({ timeout: 1000 });
-    if (box?.y === last) break;
-    last = box?.y;
+    const at = box ? `${box.x},${box.y}` : null;
+    if (at === last) break;
+    last = at;
   }
 }
 
