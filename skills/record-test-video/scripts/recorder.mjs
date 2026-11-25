@@ -6,7 +6,8 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { chmodSync, appendFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { chromeHeight, renderChromeTrack, trackChrome } from './browser-chrome.mjs';
+import { openApiConsole } from './api-console.mjs';
+import { chromeHeight, displayUrl, renderChromeTrack, trackChrome } from './browser-chrome.mjs';
 import { chromium, devices, request as apiRequest, expect as playwrightExpect } from 'playwright/test';
 
 export const expect = playwrightExpect;
@@ -396,19 +397,21 @@ function paneBadge(pane, active) {
 }
 
 async function openPane(browser, definition, options, result, multi, shared) {
-  const label = definition.label ?? definition.id;
+  const label = definition.label ?? (definition.kind === 'api' && definition.id === 'main' ? 'API' : definition.id);
   const { viewport } = definition;
   const context = await browser.newContext({ viewport: { width: viewport.width, height: viewport.height }, ...(viewport.mobile ? MOBILE_CONTEXT : {}), baseURL: definition.baseURL ?? options.baseURL, locale: 'en-GB', timezoneId: options.timezoneId, ...options.contextOptions, ...definition.contextOptions });
   context.setDefaultTimeout(STEP_TIMEOUT_MS);
   await context.addInitScript(drawPointer, { touch: Boolean(viewport.mobile) });
   const page = await context.newPage();
+  const api = definition.kind === 'api';
   if (options.human !== false) {
     humanize(page, options.typeDelayMs ?? TYPE_DELAY_MS);
     humanPages.add(page);
     // a new document has no pointer until the mouse moves
     page.on('load', () => { const at = pointers.get(page); if (at) page.mouse.move(at.x, at.y).catch(() => {}); });
   }
-  const chrome = options.browserChrome === false ? null : trackChrome(page, shared);
+  const baseURL = definition.baseURL ?? options.baseURL;
+  const chrome = options.browserChrome === false ? null : trackChrome(page, shared, api ? { url: baseURL ?? '', title: /\bapi\b/i.test(label) ? label : `${label} · API` } : null);
   const tag = multi ? `[${label}] ` : '';
   page.on('pageerror', (error) => {
     result.consoleErrors.push(`${tag}pageerror: ${error.message}`.slice(0, 300));
@@ -425,7 +428,24 @@ async function openPane(browser, definition, options, result, multi, shared) {
     result.failedRequests.push(`${tag}${response.status()} ${response.request().method()} ${response.url()}`.slice(0, 300));
     chrome?.countServerError();
   });
-  return { id: definition.id, label, context, page, viewport, chrome };
+  const pane = { id: definition.id, label, context, page, viewport, chrome };
+  if (api) {
+    // the API's own requests come from Node, so the page's response event never sees them: they are counted here
+    const track = (info) => {
+      chrome?.update({ url: displayUrl(info.url, options.scrub) });
+      if (info.status >= 500) {
+        result.failedRequests.push(`${tag}${info.status} ${info.method} ${info.url}`.slice(0, 300));
+        chrome?.countServerError();
+      }
+      pane.onRequest?.(info);
+    };
+    // its own request context, outside the pane's tracing: a trace records request headers and bodies in full,
+    // and an API scenario's are logins and tokens. The report's request lines and the video say what was sent
+    const settings = { ...options.contextOptions, ...definition.contextOptions };
+    pane.apiRequest = await apiRequest.newContext({ baseURL, ignoreHTTPSErrors: settings.ignoreHTTPSErrors, extraHTTPHeaders: settings.extraHTTPHeaders, httpCredentials: settings.httpCredentials, proxy: settings.proxy });
+    pane.console = await openApiConsole({ page, context, request: pane.apiRequest, label, baseURL, scrub: (text) => options.scrub(text), addSecret: options.addSecret, track });
+  }
+  return pane;
 }
 
 /**
@@ -486,7 +506,7 @@ async function runScenario(browser, scenario, options, dirs, root) {
   rmSync(join(dirs.failures, `${name}.png`), { force: true });
 
   // a pane's own viewport wins over the scenario's: an admin panel stays on a desktop beside a site on a phone
-  const definitions = (scenario.panes ?? [{ id: 'main' }]).map((definition) => ({ ...definition, viewport: resolveViewport(definition.viewport ?? scenario.viewport ?? 'desktop') })), multi = definitions.length > 1;
+  const definitions = (scenario.panes ?? [{ id: 'main', kind: scenario.kind }]).map((definition) => ({ ...definition, viewport: resolveViewport(definition.viewport ?? scenario.viewport ?? 'desktop') })), multi = definitions.length > 1;
   const panes = [];
   const shared = { passed: 0, failed: 0 }; // what every pane's browser frame shows alike
   for (const definition of definitions) panes.push(await openPane(browser, definition, options, result, multi, shared));
@@ -504,6 +524,15 @@ async function runScenario(browser, scenario, options, dirs, root) {
     pane.startedAt = Date.now();
   }
   const startedAt = panes[0].startedAt;
+  for (const pane of panes) {
+    // each request is a line of the report, on the video's clock
+    pane.onRequest = (info) => {
+      const answer = info.error ? `no response: ${info.error}` : `${info.status}${info.statusText ? ` ${info.statusText}` : ''}, ${info.timeMs} ms`;
+      const entry = { kind: 'request', text: `${info.method} ${info.path} → ${answer}`, status: info.error ? 'failed' : 'info', at: Date.now() - startedAt - (info.timeMs ?? 0) };
+      if (multi) entry.pane = pane.label;
+      result.steps.push(entry);
+    };
+  }
   for (const pane of panes) await pane.context.tracing.start({ screenshots: true, snapshots: true });
 
   let active = null;
@@ -554,7 +583,8 @@ async function runScenario(browser, scenario, options, dirs, root) {
       countInFrames('failed');
       entry.status = 'failed';
       result.status = 'failed';
-      result.error = String(error.message ?? error).replace(/\u001b\[[0-9;]*m/g, '').slice(0, 1200);
+      // scrubbed before the closing chapter shows it on video, not only in the report
+      result.error = options.scrub(String(error.message ?? error).replace(/\u001b\[[0-9;]*m/g, '')).slice(0, 1200);
       await page.screenshot({ path: join(dirs.failures, `${name}.png`) }).catch(() => {});
       if (kind === 'check' && opts.highlight) unmark = await drawMark(page, opts.highlight, 'fail', opts.note);
       const hideFailure = await showCaption(page, `✗ ${text}`, 'fail', kind === 'check' && await underCaption(page, opts.highlight));
@@ -570,7 +600,15 @@ async function runScenario(browser, scenario, options, dirs, root) {
   const paneApi = (pane) => ({
     page: pane.page,
     context: pane.context,
-    request: pane.context.request,
+    request: pane.apiRequest ?? pane.context.request, // an API pane's raw requests share send()'s cookies
+    /**
+     * An API pane only (kind: 'api'): fills the request in the client on screen, clicks Send, returns the response
+     * { status, statusText, ok, headers, text, json(), timeMs }. request: { method, url, params?, headers?, body?, form? };
+     * opts: { reveal: [field names that only look secret], type: false, timeout }
+     */
+    send: pane.console?.send,
+    /** An API pane only: locators for checks: status, time, body, field('items[0].id'), header('location') */
+    ui: pane.console?.ui,
     /** An action of the scenario, shown as a caption */
     step: (text, action) => record(pane, 'step', text, action),
     /**
@@ -609,7 +647,7 @@ async function runScenario(browser, scenario, options, dirs, root) {
     await scenario.run(api);
   } catch (error) {
     result.status = 'failed';
-    result.error ??= String(error.message ?? error).replace(/\u001b\[[0-9;]*m/g, '').slice(0, 1200);
+    result.error ??= options.scrub(String(error.message ?? error).replace(/\u001b\[[0-9;]*m/g, '')).slice(0, 1200);
     crashedAt = Date.now() - startedAt;
   }
   // without checks the video proves nothing, whatever it shows
@@ -629,6 +667,7 @@ async function runScenario(browser, scenario, options, dirs, root) {
     const trace = join(dirs.traces, `${name}${multi ? `-${pane.id}` : ''}.zip`);
     await pane.context.tracing.stop({ path: trace });
     await pane.context.close();
+    await pane.apiRequest?.dispose();
     result.traces.push(relative(root, trace));
   }
   result.trace = result.traces[0];
@@ -698,7 +737,7 @@ async function preflight(options, creds, scrub) {
 
 /** The report covers every scenario of the test: what this run did not record stays as it was, with its own date and versions */
 function report(options, results, root) {
-  const mark = { passed: '✅', failed: '❌', skipped: '⏭' };
+  const mark = { passed: '✅', failed: '❌', skipped: '⏭', info: '·' };
   const when = (iso) => (iso ? new Date(iso).toLocaleString('en-GB', { timeZone: options.timezoneId }) : '—');
   const recorded = results.filter((r) => r.status !== 'skipped');
   const failed = results.filter((r) => r.status === 'failed').length;
@@ -728,7 +767,7 @@ function report(options, results, root) {
       continue;
     }
     lines.push('| Time | Step | Result |', '|---|---|---|');
-    for (const s of r.steps) lines.push(`| ${clock(s.at)} | ${s.pane ? `[${s.pane}] ` : ''}${{ check: 'Check: ', mark: 'Showing: ' }[s.kind] ?? ''}${s.text} | ${mark[s.status]} |`);
+    for (const s of r.steps) lines.push(`| ${clock(s.at)} | ${s.pane ? `[${s.pane}] ` : ''}${{ check: 'Check: ', mark: 'Showing: ', request: 'Request: ' }[s.kind] ?? ''}${s.text} | ${mark[s.status]} |`);
     lines.push('');
     if (r.error) lines.push('Error:', '', '```', r.error, '```', '');
     if (r.consoleErrors.length) lines.push(`Browser console errors (${r.consoleErrors.length}):`, '', ...[...new Set(r.consoleErrors)].slice(0, 12).map((e) => `- \`${e.replace(/\s+/g, ' ').replace(/`/g, "'")}\``), '');
@@ -759,8 +798,9 @@ function previousResults(root) {
  * @param options.preflight  optional async ({ creds, request, expect }): throws when the credentials or the stand won't do
  * @param options.only       optional scenario ids (or env ONLY=S1,S2), to re-record part of them; S1 takes all its viewports, S1-phone one
  * @param options.viewports  optional, for every scenario: 'desktop' (the default), 'phone', '1920x1080', { width, height, id?, label?, mobile? } or a list of them
- * @param options.scenarios  [{ id, title, expected, viewports?, panes?, run({ page, context, request, step, check, highlight, panes, pause, viewport }) }];
- *                           panes: [{ id, label, baseURL?, viewport? }], recorded side by side, each with its own browser session
+ * @param options.scenarios  [{ id, title, expected, kind?, viewports?, panes?, run({ page, context, request, step, check, highlight, panes, pause, viewport, send, ui }) }];
+ *                           panes: [{ id, label, kind?, baseURL?, viewport? }], recorded side by side, each with its own browser session;
+ *                           kind: 'api' makes a pane (or the scenario's only pane) a request client with send() and ui
  */
 export async function runScenarios(options) {
   const root = resolve(expandHome(options.outDir));
@@ -781,11 +821,15 @@ export async function runScenarios(options) {
   }
   const secrets = Object.values(creds).filter((value) => value.length >= 4);
   const scrub = (text) => secrets.reduce((out, secret) => out.split(secret).join('***'), text);
+  // a token the API hands out during the run is a secret too, from then on
+  const addSecret = (value) => {
+    if (value.length >= 4 && !secrets.includes(value)) secrets.push(value);
+  };
   if (!(await preflight(options, creds, scrub))) {
     process.exitCode = 3;
     return [];
   }
-  options = { ...options, creds, scrub };
+  options = { ...options, creds, scrub, addSecret };
 
   const known = new Map(previousResults(root).map((r) => [r.id, r]));
   const allResults = () => options.scenarios.map((s) => known.get(s.id) ?? { id: s.id, title: s.title, expected: s.expected, status: 'skipped', steps: [], consoleErrors: [], failedRequests: [], video: null, trace: null });

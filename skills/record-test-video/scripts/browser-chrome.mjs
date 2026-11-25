@@ -38,16 +38,20 @@ export function displayUrl(raw, scrub = (text) => text) {
 /**
  * Follows what the frame shows for one page: address, title, loading, errors. Each change is a point on the timeline.
  * `shared` holds what all panes of a scenario show alike: the checks passed and failed.
+ * `pinned` { url, title }: the frame shows these instead of the page's own (an API pane shows the API, not its client page);
+ * only update() changes them then.
  */
-export function trackChrome(page, shared) {
-  const state = { url: '', title: '', loading: false, consoleErrors: 0, serverErrors: 0, active: false };
+export function trackChrome(page, shared, pinned = null) {
+  const state = { url: pinned?.url ?? '', title: pinned?.title ?? '', loading: false, consoleErrors: 0, serverErrors: 0, active: false };
   const timeline = [];
   const push = () => timeline.push({ at: Date.now(), ...state, passed: shared.passed, failed: shared.failed });
-  const update = (patch) => {
+  const set = (patch) => {
     if (!Object.entries(patch).some(([key, value]) => state[key] !== value)) return;
     Object.assign(state, patch);
     push();
   };
+  // what the page itself reports goes through here: a pinned address and title stay
+  const update = pinned ? ({ url, title, ...rest }) => set(rest) : set;
   const main = (frame) => frame === page.mainFrame();
   // during a navigation the context is gone and title() throws: the next event brings it
   const syncTitle = async () => {
@@ -77,7 +81,7 @@ export function trackChrome(page, shared) {
   return {
     timeline,
     push,
-    update,
+    update: set,
     countConsoleError: () => update({ consoleErrors: state.consoleErrors + 1 }),
     countServerError: () => update({ serverErrors: state.serverErrors + 1 }),
     /** Around each step: a title set by script and a navigation that never fired load are caught here */

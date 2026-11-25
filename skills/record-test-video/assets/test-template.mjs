@@ -47,5 +47,18 @@ await runScenarios({
         await site.check('The site shows the new price', () => expect(price).toHaveText('$1,900'), { highlight: price, note: 'Changed from the admin' });
       },
     },
+    {
+      id: 'S3',
+      title: 'An order created through the API',
+      expected: 'POST /orders answers 201 with the order in status new',
+      kind: 'api', // a request client on screen instead of a site; in panes: { id: 'api', label: 'API', kind: 'api', baseURL }
+      run: async ({ send, ui, step, check, creds }) => {
+        const login = await step('Sign in as the test user', () => send({ method: 'POST', url: '/auth/login', body: { email: creds.LOCAL_USER_EMAIL, password: creds.LOCAL_USER_PASSWORD } }));
+        const token = login.json().access_token;
+        const res = await step('Create an order', () => send({ method: 'POST', url: '/orders', headers: { Authorization: `Bearer ${token}` }, body: { item: 'Racket', qty: 2 } }));
+        await check('The server answers 201 Created', () => expect(res.status).toBe(201), { highlight: ui.status });
+        await check('The order is new', () => expect(res.json().status).toBe('new'), { highlight: ui.field('status') });
+      },
+    },
   ],
 });
