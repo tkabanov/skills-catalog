@@ -79,48 +79,88 @@ async function showCaption(page, text, tone, atTop = false) {
  */
 const simulatedBadge = (labels) => `<div style="position:fixed;right:12px;top:12px;max-width:46%;padding:6px 12px;border-radius:8px;background:#b45309;color:#fff;font:700 14px/1.35 system-ui,sans-serif;box-shadow:0 2px 10px rgba(0,0,0,.35);z-index:2147483646">${labels.map((label) => `⚡ Simulated by the test: ${escapeHtml(label)}`).join('<br>')}</div>`;
 
-/** Ready-made conditions for simulate(): each gets { page, context } and returns how to undo it */
+/**
+ * offline() and throttle() set the same thing in Chromium, its network conditions, and the last call wins: throttle
+ * turned the network back on under offline, and the end of offline took the throttle away. So both only change this
+ * state, one per browser context, and apply() sends the sum of it: setOffline first, then the throttle over it.
+ */
+const networkStates = new WeakMap();
+const networkOf = (context) => {
+  if (!networkStates.has(context)) networkStates.set(context, { offline: 0, throttles: [], cdp: null });
+  const state = networkStates.get(context);
+  state.apply ??= async () => {
+    const offline = state.offline > 0;
+    await context.setOffline(offline);
+    if (!state.cdp) return;
+    const throttle = state.throttles.at(-1);
+    await state.cdp.send('Network.emulateNetworkConditions', {
+      offline,
+      latency: throttle?.latencyMs ?? 0,
+      downloadThroughput: throttle ? (throttle.downloadKbps * 1024) / 8 : -1,
+      uploadThroughput: throttle ? (throttle.uploadKbps * 1024) / 8 : -1,
+    });
+    // the session stays until the page closes: detaching it drops its conditions, offline included
+  };
+  return state;
+};
+
+/** The faults below act on the browser: an API pane's requests are sent by Node and would not notice them */
+const browserOnly = (name, api) => {
+  if (api) throw new Error(`faults.${name}() works on a browser page only: an API pane's requests are sent by Node, not by the page`);
+};
+
+/** Ready-made conditions for simulate(): each gets { page, context, api } and returns how to undo it */
 export const faults = {
-  /** The browser has no network at all (context.setOffline) */
-  offline: () => async ({ context }) => {
-    await context.setOffline(true);
-    return () => context.setOffline(false);
+  /** The browser has no network at all */
+  offline: () => async ({ context, api }) => {
+    browserOnly('offline', api);
+    const network = networkOf(context);
+    network.offline += 1;
+    await network.apply();
+    return async () => {
+      network.offline -= 1;
+      await network.apply();
+    };
   },
   /** Requests matching `url` (a glob, RegExp or predicate, as page.route takes) get this answer instead of the server's */
-  respond: (url, { status = 500, body = '', contentType = 'application/json', headers } = {}) => async ({ page }) => {
+  respond: (url, { status = 500, body = '', contentType = 'application/json', headers } = {}) => async ({ page, api }) => {
+    browserOnly('respond', api);
     const handler = (route) => route.fulfill({ status, body: typeof body === 'string' ? body : JSON.stringify(body), contentType, headers });
     await page.route(url, handler);
     return () => page.unroute(url, handler);
   },
   /** Requests matching `url` fail with no answer, as a dropped connection does (route.abort) */
-  abort: (url, errorCode = 'failed') => async ({ page }) => {
+  abort: (url, errorCode = 'failed') => async ({ page, api }) => {
+    browserOnly('abort', api);
     const handler = (route) => route.abort(errorCode);
     await page.route(url, handler);
     return () => page.unroute(url, handler);
   },
-  /** Requests matching `url` reach the server `ms` later */
-  delay: (url, ms) => async ({ page }) => {
+  /** Requests matching `url` go on `ms` later: to the server, or to another fault on the same url (respond, abort) */
+  delay: (url, ms) => async ({ page, api }) => {
+    browserOnly('delay', api);
     const handler = async (route) => {
       await sleep(ms);
-      await route.continue().catch(() => {});
+      // fallback, not continue: continue goes straight to the server and skips a respond() or abort() set before
+      await route.fallback().catch(() => {});
     };
     await page.route(url, handler);
     return () => page.unroute(url, handler);
   },
   /** A slow network for the whole page (Chromium only, through CDP): added latency and bandwidth in kbit/s */
-  throttle: ({ latencyMs = 400, downloadKbps = 400, uploadKbps = 200 } = {}) => async ({ page, context }) => {
-    const cdp = await context.newCDPSession(page);
-    const set = (on) => cdp.send('Network.emulateNetworkConditions', {
-      offline: false,
-      latency: on ? latencyMs : 0,
-      downloadThroughput: on ? (downloadKbps * 1024) / 8 : -1,
-      uploadThroughput: on ? (uploadKbps * 1024) / 8 : -1,
-    });
-    await cdp.send('Network.enable');
-    await set(true);
+  throttle: ({ latencyMs = 400, downloadKbps = 400, uploadKbps = 200 } = {}) => async ({ page, context, api }) => {
+    browserOnly('throttle', api);
+    const network = networkOf(context);
+    if (!network.cdp) {
+      network.cdp = await context.newCDPSession(page);
+      await network.cdp.send('Network.enable');
+    }
+    const throttle = { latencyMs, downloadKbps, uploadKbps };
+    network.throttles.push(throttle);
+    await network.apply();
     return async () => {
-      await set(false).catch(() => {});
-      await cdp.detach().catch(() => {});
+      network.throttles.splice(network.throttles.indexOf(throttle), 1);
+      await network.apply();
     };
   },
 };
@@ -563,7 +603,7 @@ async function runScenario(browser, scenario, options, dirs, root) {
     /**
      * Turns on a condition the test makes up — no network, a forced 500, a slow or dropped request — and says so on
      * screen: a caption when it starts, a badge that stays while it is on, a caption when it ends, and lines in the
-     * report; console errors and 5xx it causes are marked as staged. `start({ page, context })` sets it up and returns
+     * report; console errors and 5xx it causes are marked as staged. `start({ page, context, api })` sets it up and returns
      * how to undo it (or use one of `faults`). Returns `end()`, which undoes it on screen; anything still on at the end
      * of the scenario is undone then. `label` says what is simulated in the viewer's words ("No internet connection").
      */
@@ -575,20 +615,24 @@ async function runScenario(browser, scenario, options, dirs, root) {
       const entry = { kind: 'simulate', text: label, status: 'passed', at: Date.now() - startedAt };
       if (multi) entry.pane = pane.label;
       result.steps.push(entry);
-      result.simulations.push({ label, pane: multi ? pane.label : undefined, at: entry.at, endedAt: null });
-      const record_ = result.simulations.at(-1);
       const hide = await showCaption(page, `⚡ Simulating: ${label}`, 'simulated');
       await sleep(STEP_LEAD_MS);
       let undo;
       try {
-        undo = await start({ page, context: pane.context });
+        undo = await start({ page, context: pane.context, api: Boolean(pane.apiRequest) });
       } catch (error) {
         await hide();
+        // the moment the video marks as the failure
+        entry.shownAt = Date.now() - startedAt;
+        entry.endedAt = entry.shownAt;
         entry.status = 'failed';
         result.status = 'failed';
         result.error = options.scrub(`Could not simulate "${label}": ${String(error.message ?? error)}`).slice(0, 1200);
         return noop;
       }
+      // listed only once it is really on: a condition that failed to start was never simulated
+      const simulation = { label, pane: multi ? pane.label : undefined, at: entry.at, endedAt: null };
+      result.simulations.push(simulation);
       pane.simulating.push(label);
       const redrawBadge = async () => {
         await pane.hideSimulated?.();
@@ -606,18 +650,26 @@ async function runScenario(browser, scenario, options, dirs, root) {
       const end = async () => {
         if (ended) return;
         ended = true;
-        await activate(pane);
         const closing = { kind: 'simulate', text: `${label}: ended, back to normal`, status: 'passed', at: Date.now() - startedAt };
         if (multi) closing.pane = pane.label;
-        result.steps.push(closing);
-        const hideEnd = await showCaption(page, `⚡ Simulation ended: ${label}`, 'simulated');
-        await undo?.();
-        pane.simulating.splice(pane.simulating.indexOf(label), 1);
+        let hideEnd = null;
+        try {
+          await activate(pane);
+          result.steps.push(closing);
+          hideEnd = await showCaption(page, `⚡ Simulation ended: ${label}`, 'simulated');
+        } finally {
+          // undone even when the page can no longer show the caption
+          try {
+            await undo?.();
+          } finally {
+            pane.simulating.splice(pane.simulating.indexOf(label), 1);
+          }
+        }
         await redrawBadge();
-        record_.endedAt = Date.now() - startedAt;
-        closing.shownAt = record_.endedAt;
+        simulation.endedAt = Date.now() - startedAt;
+        closing.shownAt = simulation.endedAt;
         await sleep(options.stepPauseMs ?? 900);
-        await hideEnd();
+        await hideEnd?.();
         closing.endedAt = Date.now() - startedAt;
       };
       pane.pendingSimulations.push(end);
