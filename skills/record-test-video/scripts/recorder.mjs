@@ -97,6 +97,17 @@ const drawPointer = ({ touch }) => {
   const RESET = 'margin:0;padding:0;inset:auto;overflow:visible;background:none;';
   let pointer = null;
   let raising = false;
+  // The recorder's own elements and Playwright's glass: their toggles must not raise anything
+  const isOurs = (target) => target instanceof Element && (target.hasAttribute('data-pw-recorder') || target.localName === 'x-pw-glass');
+  // Closed shadow roots, kept so that the scroll can find a slotted element's slot (its assignedSlot is null there)
+  const closedRoots = new WeakMap();
+  const { attachShadow } = Element.prototype;
+  Element.prototype.attachShadow = function (...args) {
+    const root = attachShadow.apply(this, args);
+    if (root.mode === 'closed') closedRoots.set(this, root);
+    return root;
+  };
+  Object.defineProperty(window, Symbol.for('pw-recorder.closedRoots'), { value: closedRoots });
   const showOnTop = (element) => {
     if (!element?.isConnected) return;
     try {
@@ -129,7 +140,7 @@ const drawPointer = ({ touch }) => {
     if (typeof original !== 'function') return;
     proto[name] = function (...args) {
       const result = original.apply(this, args);
-      if (!raising && !(this instanceof Element && this.hasAttribute('data-pw-recorder'))) raise();
+      if (!raising && !isOurs(this)) raise();
       return result;
     };
   };
@@ -138,9 +149,10 @@ const drawPointer = ({ touch }) => {
   after(HTMLElement.prototype, 'togglePopover');
   // Opened from markup (popovertarget, commandfor) or in full screen: no method of the page is called. The toggle event
   // does not bubble but is seen while capturing; it comes a task later, so for a moment theirs can be on top.
-  const isOurs = (target) => target instanceof Element && (target.hasAttribute('data-pw-recorder') || target.localName === 'x-pw-glass');
+  // <details> fires toggle too but opens nothing in the top layer: only a popover, a dialog or full screen counts.
+  const inTopLayer = (target) => target instanceof HTMLElement && (target.hasAttribute('popover') || target instanceof HTMLDialogElement || target === document.fullscreenElement);
   addEventListener('toggle', (event) => {
-    if (event.newState === 'open' && !isOurs(event.target)) raise();
+    if (event.newState === 'open' && inTopLayer(event.target) && !isOurs(event.target)) raise();
   }, true);
   addEventListener('fullscreenchange', () => {
     if (document.fullscreenElement) raise();
@@ -209,35 +221,47 @@ async function scrollSmoothly(locator) {
   if (!box || (box.y >= FIXED_TOP_PX && box.y + box.height <= height - CAPTION_PX && box.x >= 0 && box.x + box.width <= width)) return;
   // Like a wheel, not scrollIntoView: that one also scrolls overflow:hidden boxes, which a person can't, so a drawer
   // with a few hidden pixels of overflow slid up in the video. Each box that really scrolls, innermost first, on both
-  // axes, centres the element in the part of it that is on screen, as far as it can. Out of a shadow root through its
-  // host; the page stays put when it is locked (overflow hidden, as under a modal) or the element sits in a fixed box.
+  // axes, centres the element in the part of its content area that is on screen, as far as it can. Out of a shadow
+  // root through its host, through the slot of a closed one too; the page stays put when it is locked (overflow
+  // hidden, as under a modal) or the element is fixed or sits in a fixed box.
   await locator.evaluate((node, { safeTop, safeBottom }) => {
-    const parentOf = (el) => el.assignedSlot ?? el.parentElement ?? (el.parentNode instanceof ShadowRoot ? el.parentNode.host : null);
+    const closedRoots = window[Symbol.for('pw-recorder.closedRoots')];
+    const slotOf = (el) => {
+      if (el.assignedSlot) return el.assignedSlot;
+      const root = el.parentElement && closedRoots?.get(el.parentElement);
+      return root ? [...root.querySelectorAll('slot')].find((slot) => slot.assignedNodes().includes(el)) ?? null : null;
+    };
+    const parentOf = (el) => slotOf(el) ?? el.parentElement ?? (el.parentNode instanceof ShadowRoot ? el.parentNode.host : null);
     const scrolls = (value) => value === 'auto' || value === 'scroll';
     const page = document.scrollingElement ?? document.documentElement;
+    const rootStyle = getComputedStyle(document.documentElement);
+    // the body's overflow belongs to the viewport when the root's is visible: then the body itself does not scroll
+    const bodyIsViewport = rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible';
     const scrollers = [];
-    let fixed = false;
-    for (let el = parentOf(node); el; el = parentOf(el)) {
-      if (el === page) continue;
+    let fixed = getComputedStyle(node).position === 'fixed';
+    for (let el = parentOf(node); el && !fixed; el = parentOf(el)) {
+      if (el === page || (el === document.body && bodyIsViewport)) continue;
       const style = getComputedStyle(el);
       const y = scrolls(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
       const x = scrolls(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
-      if (x || y) scrollers.push({ el, x, y });
-      if (style.position === 'fixed') {
-        fixed = true;
-        break;
-      }
+      if (x || y) scrollers.push({ el, x, y, rtl: style.direction === 'rtl' });
+      fixed = style.position === 'fixed';
     }
     if (!fixed) {
       // the page's overflow is the root's, or the body's when the root's is visible
-      const root = getComputedStyle(document.documentElement), body = document.body ? getComputedStyle(document.body) : root;
+      const body = document.body ? getComputedStyle(document.body) : rootStyle;
       const open = (axis) => {
-        const value = root[axis] === 'visible' ? body[axis] : root[axis];
+        const value = bodyIsViewport ? body[axis] : rootStyle[axis];
         return value !== 'hidden' && value !== 'clip';
       };
-      scrollers.push({ el: page, x: open('overflowX'), y: open('overflowY'), page: true });
+      scrollers.push({ el: page, x: open('overflowX'), y: open('overflowY'), rtl: rootStyle.direction === 'rtl', page: true });
     }
     const view = { top: safeTop, bottom: innerHeight - safeBottom, left: 0, right: innerWidth };
+    /** the content area of a box on screen: without its border and scrollbars */
+    const contentOf = (el) => {
+      const r = el.getBoundingClientRect(), left = r.left + el.clientLeft, top = r.top + el.clientTop;
+      return { top, left, bottom: top + el.clientHeight, right: left + el.clientWidth };
+    };
     const pending = { x: 0, y: 0 };
     const along = (scroller, axis) => {
       const [start, end, size, offset, scrollSize, clientSize] = axis === 'y'
@@ -245,15 +269,16 @@ async function scrollSmoothly(locator) {
         : ['left', 'right', 'width', 'scrollLeft', 'scrollWidth', 'clientWidth'];
       const box = node.getBoundingClientRect();
       const from = box[start] - pending[axis], to = box[end] - pending[axis];
-      const rect = scroller.page ? view : scroller.el.getBoundingClientRect();
+      const rect = scroller.page ? view : contentOf(scroller.el);
       // the part of the box on screen; a box off screen counts whole
       let low = Math.max(rect[start], view[start]), high = Math.min(rect[end], view[end]);
       if (high - low < box[size]) [low, high] = [rect[start], rect[end]];
       if (from >= low && to <= high) return 0;
       const wanted = (from + to) / 2 - (low + high) / 2;
       const { el } = scroller;
-      const room = wanted > 0 ? el[scrollSize] - el[clientSize] - el[offset] : -el[offset];
-      const delta = wanted > 0 ? Math.min(wanted, room) : Math.max(wanted, room);
+      // right to left, scrollLeft runs from 0 down to minus the overflow
+      const span = el[scrollSize] - el[clientSize], [min, max] = axis === 'x' && scroller.rtl ? [-span, 0] : [0, span];
+      const delta = Math.min(Math.max(wanted, min - el[offset]), max - el[offset]);
       return Math.abs(delta) < 1 ? 0 : delta;
     };
     for (const scroller of scrollers) {
@@ -272,6 +297,17 @@ async function scrollSmoothly(locator) {
     if (at === last) break;
     last = at;
   }
+}
+
+/** Whether any of the element shows in the viewport, clipping by its boxes counted, as toBeInViewport() sees it */
+async function visibleInViewport(locator) {
+  return locator.evaluate((node) => new Promise((done) => {
+    const observer = new IntersectionObserver(([entry]) => {
+      observer.disconnect();
+      done(entry.intersectionRatio > 0);
+    });
+    observer.observe(node);
+  }), undefined, { timeout: 1000 }).catch(() => true);
 }
 
 /** Only for the look: a failure here must not fail a test, the action itself decides */
@@ -338,7 +374,11 @@ function humanize(page, typeDelayMs) {
   L.scrollIntoViewIfNeeded = async function (options) {
     if (!humanPages.has(this.page())) return scrollIntoViewIfNeeded.call(this, options);
     await this.waitFor({ state: 'attached', timeout: options?.timeout });
-    return scrollSmoothly(this);
+    await scrollSmoothly(this).catch(() => {});
+    // An explicit call promises the element in view. The wheel leaves overflow:hidden boxes alone (a carousel scrolled
+    // by script, a page locked under a modal); when one of them still hides the element, Playwright scrolls as it does.
+    if (!(await visibleInViewport(this))) return scrollIntoViewIfNeeded.call(this, options);
+    return undefined;
   };
 
   // page.fill(selector, ...) and the like go past the Locator, so they are sent through it

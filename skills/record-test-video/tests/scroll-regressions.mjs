@@ -31,6 +31,13 @@ const PAGES = {
   // 8: <details> also fires toggle events; the recorder should not react with popover toggles of its own
   '/details': page(`<button id="t" style="margin:20px">hover me</button><details id="d"><summary>FAQ</summary>answer</details>
 <script>window.recorderToggles = 0; for (const type of ['toggle', 'beforetoggle']) addEventListener(type, (e) => { if (e.target instanceof Element && (e.target.hasAttribute('data-pw-recorder') || e.target.localName === 'x-pw-glass')) window.recorderToggles += 1; }, true);</script>`),
+  // 9: a modal drawer, overflow:hidden with a few hidden pixels of overflow (an sr-only label positioned by the dialog)
+  '/drawer': page(`<dialog id="dlg" style="position:fixed;inset:0 0 0 auto;margin:0;height:100vh;max-height:none;width:360px;padding:0;border:0;overflow:hidden">
+<header style="height:60px;background:#333;color:#fff">Drawer</header><span style="position:absolute;bottom:-40px;width:1px;height:1px;overflow:hidden">label</span>
+<div style="height:calc(100% - 60px);overflow:auto"><div style="height:1500px"></div><button id="t">save</button><div style="height:300px"></div></div></dialog>
+<script>document.querySelector('#dlg').showModal();</script>`),
+  // 10: a page to show a caption on
+  '/plain': page(`<button id="t" style="margin:20px">hover me</button>`),
 };
 
 const server = createServer((req, res) => {
@@ -122,6 +129,27 @@ const scenarios = [
         await p.waitForTimeout(200);
       });
       await check('No recorder toggle events', async () => expect(await p.evaluate(() => window.recorderToggles)).toBe(0));
+    },
+  },  {
+    id: 'R9', title: 'A drawer with hidden overflow does not slide up', expected: 'Only the drawer body scrolls; the dialog stays at 0',
+    run: async ({ page: p, step, check }) => {
+      await step('Open', () => p.goto('/drawer'));
+      const t = p.locator('#t');
+      await step('Scroll to the button', () => t.scrollIntoViewIfNeeded());
+      await step('Click the button', () => t.click());
+      await check('The dialog did not scroll, the button is in view', async () => {
+        expect(await p.evaluate(() => document.querySelector('#dlg').scrollTop)).toBe(0);
+        await expect(t).toBeInViewport({ timeout: 500 });
+      });
+    },
+  },
+  {
+    id: 'R10', title: "Playwright's overlay is still the x-pw-glass popover", expected: 'An open x-pw-glass popover while a caption is shown',
+    // The recorder raises the overlay above the page's dialogs by this private name. If Playwright renames it, the
+    // captions end up under a drawer again without a word: this check says so instead.
+    run: async ({ page: p, step, check }) => {
+      await step('Open', () => p.goto('/plain'));
+      await check('x-pw-glass is an open popover', async () => expect(await p.evaluate(() => Boolean(document.querySelector('x-pw-glass')?.matches(':popover-open')))).toBe(true));
     },
   },
 ];
