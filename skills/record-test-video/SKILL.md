@@ -86,6 +86,7 @@ Copy `assets/test-template.mjs` from this skill. Each scenario gets:
 - `check('What should be there', fn)`: a real assertion with `expect`, shown with ✓. If it fails, the scenario fails and the remaining steps are skipped.
 - `pause(ms)`: time to read the screen.
 - `highlight(locator, 'note')`: draws attention without proving anything.
+- `simulate('No internet connection', faults.offline())`: turns on a failure the test stages and says so on screen until `end()` (see "Show a staged failure as staged" below).
 - also `page`, `context`, `request`, `creds`.
 
 **Show the result, don't just assert it.** On the check that proves the scenario's point, pass `{ highlight: locator, note: 'Now' }`, or an array of locators: once the check has passed, the rest of the screen dims and a ring is drawn around the element, red if the check failed. Use it on the few moments that matter. When everything is highlighted, nothing is. A `highlight()` on its own is not evidence, so don't let it stand where a check belongs.
@@ -105,6 +106,24 @@ Node sends the request, so there is no CORS, and the page gets only a copy to sh
 **The browser frame.** Each video has a browser bar drawn above the page: the tab with the page title, the address bar with the current URL (a lock for https, "Not secure" for plain http away from localhost), a loading indicator, and chips for a tester: the clock, which reads the same as "Time" in the report, checks passed ✓ and failed ✗, console errors and 5xx so far, the scenario id, the screen and the environment. With several panes each pane has its own bar with the pane's name, and the active pane's bar turns blue. An API pane's bar shows the address of the last request. A phone gets a compact two-line bar. The bar sits above the page, not over it, so it hides nothing, and the video is 80 px taller (64 on a phone). The address is part of the evidence: a check that a page opened is more convincing when the viewer sees which URL it is. Values of query parameters that look secret (`token`, `key`, `code`, `password`, `session`...) show as `***`, and so do the registry's values. A secret anywhere else in the path does show, so look at the bar on the contact sheet. `browserChrome: false` in the run options turns it off.
 
 **Choose the screens.** By default a scenario records on a desktop, 1280x800. Set `viewports` in the run options for all scenarios, or on one scenario: `'phone'`, `['desktop', 'phone']`, `'1920x1080'`, or `{ id: 'tablet', label: 'tablet', width: 768, height: 1024, mobile: true }`. Take what the task or the user names; otherwise judge by who uses this screen, and add the phone where participants work from one. Each screen is its own video and its own line in the report, with the id `S1-phone`, and `ONLY=S1` re-records all of a scenario's screens. A scenario that behaves differently can read `viewport` (`id`, `width`, `mobile`). `'phone'` is Pixel 7 emulated in Chromium, with touch and a mobile user agent: it shows layout and touch, not the quirks of a real device or of Safari, so name that in the report. Use `locator.tap()` where the tap itself is what you test. Panes take their own screen too: `panes: [{ id: 'admin', label: 'Admin', viewport: 'desktop' }, { id: 'site', label: 'Site', viewport: 'phone' }]`.
+
+**Show a staged failure as staged.** To show how the app copes with something that would not happen on its own during the recording (no internet, a server error, a slow network, a dropped request), the test makes the condition up. A viewer must never take that for a real failure of the system, nor the recovery for a fix of one. So every such condition goes through `simulate(label, start)`, never a bare `page.route` or `setOffline` in the middle of a scenario:
+
+```js
+const end = await simulate('The server fails to load the start editor (HTTP 500)', faults.respond(/\/start\/\d+\/editor/, { status: 500 }));
+await step('Open the organizers', () => page.getByRole('button', { name: 'Organizers' }).click());
+await check('An error with "Retry" instead of an empty list', () => expect(retry).toBeVisible(), { highlight: retry });
+await end();
+await step('The server is back: click Retry', () => retry.click());
+```
+
+On screen it shows "⚡ Simulating: …" when it starts, an amber badge "Simulated by the test: …" in the corner for as long as it is on, and "⚡ Simulation ended: …" when `end()` is called. The report gets the same lines, a list of the simulated conditions with their times, and every console error and 5xx caught while one was on is marked `[during simulation: …]`, so nobody files it as a server bug. A simulation still on when the scenario finishes is ended then. Ready-made conditions, all importable with `runScenarios`: `faults.offline()` (no network at all), `faults.respond(url, { status, body })` (the server's answer replaced), `faults.abort(url)` (no answer, a dropped connection), `faults.delay(url, ms)` (a slow endpoint), `faults.throttle({ latencyMs, downloadKbps, uploadKbps })` (a slow network for the whole page, Chromium only). They combine: `offline()` and `throttle()` share the network state, and a `delay()` on a url passes on to a `respond()` or `abort()` on the same url, so "slow, then 500" works. They act on a browser page only; on an API pane they fail with a clear error, since Node sends its requests. Anything else is a `start({ page, context, api })` that sets the condition up and returns how to undo it.
+
+- **Name what is simulated and how**, in the viewer's words, in the label: "No internet connection", "The payment provider times out after 30 s", "The server answers 500 to the start editor". Not "route mocked".
+- **Write it into `scenarios.md`** as a step of its own: what is simulated, how (which request, which answer), and why it is not reproduced for real. If the scenario stands in for a failure someone reported, say whether it is the same cause or a stand-in ("the client's prod session had expired; here the server answers 500 instead, which the same screen must handle").
+- **Show the normal state first, then the failure, then the recovery** once `end()` has run, so the video shows cause and effect, not just an error screen.
+- **Compare like with like.** When "before" and "after" videos are compared, simulate the same condition in both; a failure staged in only one of them proves nothing about the change.
+- **Say it in the report to the user**: which scenarios staged a failure, and that the errors they caused were expected.
 
 Captions are in English, for a person who has not seen the code: "Choose size M", not "click combobox". Check what the user would notice, and also the server's state when the screen alone would not prove it. A check passes on elements outside the viewport too, so scroll what it is about into view with `await el.scrollIntoViewIfNeeded()`: here it scrolls smoothly and leaves the element clear of the caption.
 
@@ -136,7 +155,7 @@ ffmpeg -y -v error -i video/s1.mp4 -vf "fps=$n/$d,scale=400:-1,tile=5x$(( (n + 4
 
 For a phone's vertical video use `scale=200:-2,tile=10x$(( (n + 9) / 10 ))`.
 
-Treat console errors and 5xx listed in the report as findings, even if every check passed: they catch what assertions miss, such as a component that failed to render.
+Treat console errors and 5xx listed in the report as findings, even if every check passed: they catch what assertions miss, such as a component that failed to render. Those marked `[during simulation: …]` were caused by the test's own `simulate()` and are expected; an error outside a simulation still is a finding.
 
 **Recording artifacts.** Some things look wrong in a video and are not in the app. Before reporting one as a defect, repeat it by hand in a real browser, with the mouse, the wheel and the keyboard. Known artifacts, both fixed in `scripts/recorder.mjs`; if one comes back, the cause is the recorder:
 
@@ -147,7 +166,7 @@ If a scenario fails, decide whether the code or the test is wrong. Fix it and re
 
 ### 8. Report
 
-Give the folder path, the result per scenario, and what was not covered. Link the videos by full path. Name what was not exercised for real, such as a payment stub instead of the real provider.
+Give the folder path, the result per scenario, and what was not covered. Link the videos by full path. Name what was not exercised for real, such as a payment stub instead of the real provider, and every failure a scenario staged with `simulate()`.
 
 ## Privacy and safety
 

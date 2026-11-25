@@ -2,7 +2,7 @@
 // No secrets in this file: logins and passwords come from ~/test-videos/<project>/credentials.env, as creds.
 import { homedir } from 'node:os';
 
-const { runScenarios, expect } = await import(`${homedir()}/.agents/skills/skills-catalog/record-test-video/scripts/recorder.mjs`);
+const { runScenarios, expect, faults } = await import(`${homedir()}/.agents/skills/skills-catalog/record-test-video/scripts/recorder.mjs`);
 
 await runScenarios({
   outDir: '~/test-videos/<project>/<task>',
@@ -58,6 +58,23 @@ await runScenarios({
         const res = await step('Create an order', () => send({ method: 'POST', url: '/orders', headers: { Authorization: `Bearer ${token}` }, body: { item: 'Racket', qty: 2 } }));
         await check('The server answers 201 Created', () => expect(res.status).toBe(201), { highlight: ui.status });
         await check('The order is new', () => expect(res.json().status).toBe('new'), { highlight: ui.field('status') });
+      },
+    },
+    {
+      id: 'S4',
+      title: 'The order page copes with a lost connection',
+      expected: 'Offline (simulated by the test): an error with Retry; back online: Retry loads the order',
+      run: async ({ page, step, check, simulate }) => {
+        await step('Open an order', () => page.goto('/orders/1'));
+        await check('The order is shown', () => expect(page.getByRole('heading', { name: /Order/ })).toBeVisible());
+        // a staged failure: shown as staged on screen and in the report, never a bare page.route / setOffline
+        const end = await simulate('No internet connection', faults.offline());
+        await step('Reload the order', () => page.getByRole('button', { name: 'Refresh' }).click());
+        const retry = page.getByRole('button', { name: 'Retry' });
+        await check('An error with Retry, not an empty page', () => expect(retry).toBeVisible(), { highlight: retry });
+        await end();
+        await step('Back online: click Retry', () => retry.click());
+        await check('The order is shown again', () => expect(page.getByRole('heading', { name: /Order/ })).toBeVisible());
       },
     },
   ],
